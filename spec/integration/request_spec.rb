@@ -1,4 +1,4 @@
-require_relative '_lib'
+require 'spec_helper'
 
 describe RestClient::Request do
   before(:all) do
@@ -14,7 +14,8 @@ describe RestClient::Request do
       request = RestClient::Request.new(
         :method => :get,
         :url => 'https://www.mozilla.org',
-        :ssl_ca_file => File.join(File.dirname(__FILE__), "certs", "digicert.crt")
+        :verify_ssl => OpenSSL::SSL::VERIFY_PEER,
+        :ssl_ca_file => File.join(File.dirname(__FILE__), "certs", "digicert.pem")
       )
       expect { request.execute }.to_not raise_error
     end
@@ -23,105 +24,40 @@ describe RestClient::Request do
       request = RestClient::Request.new(
         :method => :get,
         :url => 'https://www.mozilla.org',
+        :verify_ssl => OpenSSL::SSL::VERIFY_PEER,
         :ssl_ca_path => File.join(File.dirname(__FILE__), "capath_digicert")
       )
       expect { request.execute }.to_not raise_error
     end
 
-    # TODO: deprecate and remove RestClient::SSLCertificateNotVerified and just
-    # pass through OpenSSL::SSL::SSLError directly. See note in
-    # lib/restclient/request.rb.
+    # I don' think this feature is useful anymore (under 1.9.3 at the very least).
     #
-    # On OS X, this test fails since Apple has patched OpenSSL to always fall
-    # back on the system CA store.
-    it "is unsuccessful with an incorrect ca_file", :unless => RestClient::Platform.mac_mri? do
+    # Exceptions in verify_callback are ignored; RestClient has to catch OpenSSL::SSL::SSLError
+    # and either re-throw it as is, or throw SSLCertificateNotVerified
+    # based on the contents of the message field of the original exception
+    #.
+    # The client has to handle OpenSSL::SSL::SSLError exceptions anyway,
+    # why make them handle both OpenSSL *AND* RestClient exceptions???
+    #
+    # also see https://github.com/ruby/ruby/blob/trunk/ext/openssl/ossl.c#L237
+    it "is unsuccessful with an incorrect ca_file" do
       request = RestClient::Request.new(
         :method => :get,
-        :url => 'https://www.mozilla.org',
+        :url => 'https://www.mozilla.com',
+        :verify_ssl => OpenSSL::SSL::VERIFY_PEER,
         :ssl_ca_file => File.join(File.dirname(__FILE__), "certs", "verisign.crt")
       )
       expect { request.execute }.to raise_error(RestClient::SSLCertificateNotVerified)
     end
 
-    # On OS X, this test fails since Apple has patched OpenSSL to always fall
-    # back on the system CA store.
-    it "is unsuccessful with an incorrect ca_path", :unless => RestClient::Platform.mac_mri? do
+    it "is unsuccessful with an incorrect ca_path" do
       request = RestClient::Request.new(
         :method => :get,
-        :url => 'https://www.mozilla.org',
+        :url => 'https://www.mozilla.com',
+        :verify_ssl => OpenSSL::SSL::VERIFY_PEER,
         :ssl_ca_path => File.join(File.dirname(__FILE__), "capath_verisign")
       )
       expect { request.execute }.to raise_error(RestClient::SSLCertificateNotVerified)
     end
-
-    it "is successful using the default system cert store" do
-      request = RestClient::Request.new(
-        :method => :get,
-        :url => 'https://www.mozilla.org',
-        :verify_ssl => true,
-      )
-      expect {request.execute }.to_not raise_error
-    end
-
-    it "executes the verify_callback" do
-      ran_callback = false
-      request = RestClient::Request.new(
-        :method => :get,
-        :url => 'https://www.mozilla.org',
-        :verify_ssl => true,
-        :ssl_verify_callback => lambda { |preverify_ok, store_ctx|
-          ran_callback = true
-          preverify_ok
-        },
-      )
-      expect {request.execute }.to_not raise_error
-      expect(ran_callback).to eq(true)
-    end
-
-    it "fails verification when the callback returns false",
-       :unless => RestClient::Platform.mac_mri? do
-      request = RestClient::Request.new(
-        :method => :get,
-        :url => 'https://www.mozilla.org',
-        :verify_ssl => true,
-        :ssl_verify_callback => lambda { |preverify_ok, store_ctx| false },
-      )
-      expect { request.execute }.to raise_error(RestClient::SSLCertificateNotVerified)
-    end
-
-    it "succeeds verification when the callback returns true",
-       :unless => RestClient::Platform.mac_mri? do
-      request = RestClient::Request.new(
-        :method => :get,
-        :url => 'https://www.mozilla.org',
-        :verify_ssl => true,
-        :ssl_ca_file => File.join(File.dirname(__FILE__), "certs", "verisign.crt"),
-        :ssl_verify_callback => lambda { |preverify_ok, store_ctx| true },
-      )
-      expect { request.execute }.to_not raise_error
-    end
   end
-
-  describe "timeouts" do
-    it "raises OpenTimeout when it hits an open timeout" do
-      request = RestClient::Request.new(
-        :method => :get,
-        :url => 'http://www.mozilla.org',
-        :open_timeout => 1e-10,
-      )
-      expect { request.execute }.to(
-        raise_error(RestClient::Exceptions::OpenTimeout))
-    end
-
-    it "raises ReadTimeout when it hits a read timeout via :read_timeout" do
-      request = RestClient::Request.new(
-        :method => :get,
-        :url => 'https://www.mozilla.org',
-        :read_timeout => 1e-10,
-      )
-      expect { request.execute }.to(
-        raise_error(RestClient::Exceptions::ReadTimeout))
-    end
-  end
-
 end

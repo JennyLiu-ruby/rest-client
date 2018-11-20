@@ -1,32 +1,15 @@
 require 'tempfile'
-require 'securerandom'
 require 'stringio'
-
-begin
-  # Use mime/types/columnar if available, for reduced memory usage
-  require 'mime/types/columnar'
-rescue LoadError
-  require 'mime/types'
-end
 
 module RestClient
   module Payload
     extend self
 
     def generate(params)
-      if params.is_a?(RestClient::Payload::Base)
-        # pass through Payload objects unchanged
-        params
-      elsif params.is_a?(String)
+      if params.is_a?(String)
         Base.new(params)
       elsif params.is_a?(Hash)
         if params.delete(:multipart) == true || has_file?(params)
-          Multipart.new(params)
-        else
-          UrlEncoded.new(params)
-        end
-      elsif params.is_a?(ParamsArray)
-        if _has_file?(params)
           Multipart.new(params)
         else
           UrlEncoded.new(params)
@@ -39,20 +22,28 @@ module RestClient
     end
 
     def has_file?(params)
-      unless params.is_a?(Hash)
-        raise ArgumentError.new("Must pass Hash, not #{params.inspect}")
+      params.any? do |_, v|
+        case v
+          when Hash
+            has_file?(v)
+          when Array
+            has_file_array?(v)
+          else
+            v.respond_to?(:path) && v.respond_to?(:read)
+        end
       end
-      _has_file?(params)
     end
 
-    def _has_file?(obj)
-      case obj
-      when Hash, ParamsArray
-        obj.any? {|_, v| _has_file?(v) }
-      when Array
-        obj.any? {|v| _has_file?(v) }
-      else
-        obj.respond_to?(:path) && obj.respond_to?(:read)
+    def has_file_array?(params)
+      params.any? do |v|
+        case v
+          when Hash
+            has_file?(v)
+          when Array
+            has_file_array?(v)
+          else
+            v.respond_to?(:path) && v.respond_to?(:read)
+        end
       end
     end
 
@@ -66,13 +57,40 @@ module RestClient
         @stream.seek(0)
       end
 
-      def read(*args)
-        @stream.read(*args)
+      def read(bytes=nil)
+        @stream.read(bytes)
       end
 
-      def to_s
-        result = read
-        @stream.seek(0)
+      alias :to_s :read
+
+      # Flatten parameters by converting hashes of hashes to flat hashes
+      # {keys1 => {keys2 => value}} will be transformed into [keys1[key2], value]
+      def flatten_params(params, parent_key = nil)
+        result = []
+        params.each do |key, value|
+          calculated_key = parent_key ? "#{parent_key}[#{handle_key(key)}]" : handle_key(key)
+          if value.is_a? Hash
+            result += flatten_params(value, calculated_key)
+          elsif value.is_a? Array
+            result += flatten_params_array(value, calculated_key)
+          else
+            result << [calculated_key, value]
+          end
+        end
+        result
+      end
+
+      def flatten_params_array value, calculated_key
+        result = []
+        value.each do |elem|
+          if elem.is_a? Hash
+            result += flatten_params(elem, calculated_key)
+          elsif elem.is_a? Array
+            result += flatten_params_array(elem, calculated_key)
+          else
+            result << ["#{calculated_key}[]", elem]
+          end
+        end
         result
       end
 
@@ -90,20 +108,14 @@ module RestClient
         @stream.close unless @stream.closed?
       end
 
-      def closed?
-        @stream.closed?
-      end
-
-      def to_s_inspect
-        to_s.inspect
+      def inspect
+        result = to_s.inspect
+        @stream.seek(0)
+        result
       end
 
       def short_inspect
-        if size && size > 500
-          "#{size} byte(s) length"
-        else
-          to_s_inspect
-        end
+        (size > 500 ? "#{size} byte(s) length" : inspect)
       end
 
     end
@@ -121,36 +133,44 @@ module RestClient
         end
       end
 
-      # TODO (breaks compatibility): ought to use mime_for() to autodetect the
-      # Content-Type for stream objects that have a filename.
-
       alias :length :size
     end
 
     class UrlEncoded < Base
       def build_stream(params = nil)
-        @stream = StringIO.new(Utils.encode_query_string(params))
+        @stream = StringIO.new(flatten_params(params).collect do |entry|
+          "#{entry[0]}=#{handle_key(entry[1])}"
+        end.join("&"))
         @stream.seek(0)
+      end
+
+      # for UrlEncoded escape the keys
+      def handle_key key
+        parser.escape(key.to_s, Regexp.new("[^#{URI::PATTERN::UNRESERVED}]"))
       end
 
       def headers
         super.merge({'Content-Type' => 'application/x-www-form-urlencoded'})
       end
+
+      private
+        def parser
+          URI.const_defined?(:Parser) ? URI::Parser.new : URI
+        end
     end
 
     class Multipart < Base
       EOL = "\r\n"
 
       def build_stream(params)
-        b = '--' + boundary
+        b = "--#{boundary}"
 
         @stream = Tempfile.new("RESTClient.Stream.#{rand(1000)}")
         @stream.binmode
         @stream.write(b + EOL)
 
-        case params
-        when Hash, ParamsArray
-          x = Utils.flatten_params(params)
+        if params.is_a? Hash
+          x = flatten_params(params)
         else
           x = params
         end
@@ -183,9 +203,9 @@ module RestClient
           s.write("Content-Disposition: form-data;")
           s.write(" name=\"#{k}\";") unless (k.nil? || k=='')
           s.write(" filename=\"#{v.respond_to?(:original_filename) ? v.original_filename : File.basename(v.path)}\"#{EOL}")
-          s.write("Content-Type: #{v.respond_to?(:content_type) ? v.content_type : mime_for(v.path)}#{EOL}")
+          s.write("Content-Type: #{v.respond_to?(:content_type) ? v.content_type : Mimes.mime_for(v.path)}#{EOL}")
           s.write(EOL)
-          while (data = v.read(8124))
+          while data = v.read(8124)
             s.write(data)
           end
         ensure
@@ -193,31 +213,12 @@ module RestClient
         end
       end
 
-      def mime_for(path)
-        mime = MIME::Types.type_for path
-        mime.empty? ? 'text/plain' : mime[0].content_type
-      end
 
       def boundary
-        return @boundary if defined?(@boundary) && @boundary
-
-        # Use the same algorithm used by WebKit: generate 16 random
-        # alphanumeric characters, replacing `+` `/` with `A` `B` (included in
-        # the list twice) to round out the set of 64.
-        s = SecureRandom.base64(12)
-        s.tr!('+/', 'AB')
-
-        @boundary = '----RubyFormBoundary' + s
+        @boundary ||= rand(1_000_000).to_s
       end
 
       # for Multipart do not escape the keys
-      #
-      # Ostensibly multipart keys MAY be percent encoded per RFC 7578, but in
-      # practice no major browser that I'm aware of uses percent encoding.
-      #
-      # Further discussion of multipart encoding:
-      # https://github.com/rest-client/rest-client/pull/403#issuecomment-156976930
-      #
       def handle_key key
         key
       end

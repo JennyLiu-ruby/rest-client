@@ -1,20 +1,23 @@
-require 'net/http'
-require 'openssl'
-require 'stringio'
 require 'uri'
+require 'zlib'
+require 'stringio'
 
-require File.dirname(__FILE__) + '/restclient/version'
-require File.dirname(__FILE__) + '/restclient/platform'
+begin
+  require 'net/https'
+rescue LoadError => e
+  raise e unless RUBY_PLATFORM =~ /linux/
+  raise LoadError, "no such file to load -- net/https. Try running apt-get install libopenssl-ruby"
+end
+
 require File.dirname(__FILE__) + '/restclient/exceptions'
-require File.dirname(__FILE__) + '/restclient/utils'
 require File.dirname(__FILE__) + '/restclient/request'
 require File.dirname(__FILE__) + '/restclient/abstract_response'
 require File.dirname(__FILE__) + '/restclient/response'
 require File.dirname(__FILE__) + '/restclient/raw_response'
 require File.dirname(__FILE__) + '/restclient/resource'
-require File.dirname(__FILE__) + '/restclient/params_array'
 require File.dirname(__FILE__) + '/restclient/payload'
-require File.dirname(__FILE__) + '/restclient/windows'
+require File.dirname(__FILE__) + '/restclient/net_http_ext'
+require File.dirname(__FILE__) + '/restclient/mimes'
 
 # This module's static methods are the entry point for using the REST client.
 #
@@ -90,24 +93,8 @@ module RestClient
     Request.execute(:method => :options, :url => url, :headers => headers, &block)
   end
 
-  # A global proxy URL to use for all requests. This can be overridden on a
-  # per-request basis by passing `:proxy` to RestClient::Request.
-  def self.proxy
-    @proxy ||= nil
-  end
-
-  def self.proxy=(value)
-    @proxy = value
-    @proxy_set = true
-  end
-
-  # Return whether RestClient.proxy was set explicitly. We use this to
-  # differentiate between no value being set and a value explicitly set to nil.
-  #
-  # @return [Boolean]
-  #
-  def self.proxy_set?
-    @proxy_set ||= false
+  class << self
+    attr_accessor :proxy
   end
 
   # Setup the log for RestClient calls.
@@ -115,6 +102,12 @@ module RestClient
   # You can also configure logging by the environment variable RESTCLIENT_LOG.
   def self.log= log
     @@log = create_log log
+  end
+
+  def self.version
+    version_path = File.dirname(__FILE__) + "/../VERSION"
+    return File.read(version_path).chomp if File.file?(version_path)
+    "0.0.0"
   end
 
   # Create a log that respond to << like a logger
@@ -167,7 +160,6 @@ module RestClient
   # Add a Proc to be called before each request in executed.
   # The proc parameters will be the http request and the request params.
   def self.add_before_execution_proc &proc
-    raise ArgumentError.new('block is required') unless proc
     @@before_execution_procs << proc
   end
 
